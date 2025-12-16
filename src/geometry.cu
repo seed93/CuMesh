@@ -84,6 +84,7 @@ static __global__ void compute_vertex_normals_kernel(
     int end = vert2face_offset[tid + 1];
 
     Vec3f normal(0.0f, 0.0f, 0.0f);
+    Vec3f first_face_normal;
     for (int i = start; i < end; i++) {
         int fid = vert2face[i];
         int3 face = faces[fid];
@@ -93,9 +94,16 @@ static __global__ void compute_vertex_normals_kernel(
 
         Vec3f face_normal = (v1 - v0).cross(v2 - v0);
         normal += face_normal;
+        if (i == start) {
+            first_face_normal = face_normal;
+        }
     }
 
     normal.normalize();
+    // if NAN, fallback to first face normal
+    if (isnan(normal.x)) {
+        normal = first_face_normal;
+    }
     vertex_normals[tid] = make_float3(normal.x, normal.y, normal.z);
 }
 

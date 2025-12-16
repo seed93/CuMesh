@@ -384,8 +384,9 @@ class CuMesh:
         compute_charts_kwargs: dict={},
         xatlas_compute_charts_kwargs: dict={},
         xatlas_pack_charts_kwargs: dict={},
+        return_vmaps: bool=False,
         verbose: bool=False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Parameterize the mesh using the accelerated mesh clustering and Xatlas
         
@@ -393,12 +394,15 @@ class CuMesh:
             compute_charts_kwargs: a dictionary of options for the compute_charts function.
             xatlas_compute_charts_kwargs: a dictionary of options for the xatlas compute_charts function.
             xatlas_pack_charts_kwargs: a dictionary of options for the xatlas pack_charts function.
+            return_vmaps: whether to return the vertex maps.
+            verbose: whether to print the progress.
             
         Returns:
-            A tuple of three tensors:
+            A tuple of:
                 - the vertex positions
                 - the face indices
                 - the uv coordinates
+                - (optional) the map from the new vertex indices to the old vertex indices
         """
         xatlas_compute_charts_kwargs['verbose'] = verbose
         xatlas_pack_charts_kwargs['verbose'] = verbose
@@ -413,32 +417,39 @@ class CuMesh:
         chart_faces = chart_faces.cpu()
         chart_vertex_offset = chart_vertex_offset.cpu()
         chart_face_offset = chart_face_offset.cpu()
+        chart_vmap = chart_vmap.cpu()
         if verbose:
             print(f"Get {num_charts} clusters after fast clustering")
         
         # 2. Xatlas packing
         xatlas = Atlas()
-        charts = []
+        chart_vmaps = []
         for i in tqdm(range(num_charts), desc="Adding clusters to xatlas", disable=not verbose):
             chart_faces_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]] - chart_vertex_offset[i]
             chart_vertices_i = chart_vertices[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-            charts.append((chart_vertices_i, chart_faces_i))
+            chart_vmap_i = chart_vmap[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
+            chart_vmaps.append(chart_vmap_i)
             xatlas.add_mesh(chart_vertices_i, chart_faces_i)
         xatlas.compute_charts(**xatlas_compute_charts_kwargs)
         xatlas.pack_charts(**xatlas_pack_charts_kwargs)
-        vertices = []
+        vmaps = []
         faces = []
         uvs = []
         cnt = 0
         for i in tqdm(range(num_charts), desc="Gathering results from xatlas", disable=not verbose):
             vmap, x_faces, x_uvs = xatlas.get_mesh(i)
-            vertices.append(charts[i][0][vmap])
+            vmaps.append(chart_vmaps[i][vmap])
             faces.append(x_faces + cnt)
             uvs.append(x_uvs)
             cnt += vmap.shape[0]
-        vertices = torch.cat(vertices, dim=0)
+        vmaps = torch.cat(vmaps, dim=0)
+        vertices = new_vertices.cpu()[vmaps]
         faces = torch.cat(faces, dim=0)
         uvs = torch.cat(uvs, dim=0)
         
-        return vertices, faces, uvs
+        out = [vertices, faces, uvs]
+        if return_vmaps:
+            out.append(vmaps)
+        
+        return tuple(out)
             
