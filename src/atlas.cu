@@ -361,6 +361,10 @@ static void get_chart_connectivity(
             mesh.atlas_chart_adj_length.size -= 1;
         }
     }
+    // Early stop if no valid edges
+    if (mesh.atlas_chart_adj.size == 0) {
+        return;
+    }
 
     // 2. Get chart-edge connectivity
     size_t E = mesh.atlas_chart_adj.size;
@@ -1066,6 +1070,7 @@ void CuMesh::compute_charts(
 
             // 1. Compute chart connectivity
             get_chart_connectivity(*this);
+            if (this->atlas_chart_adj.size == 0) break;
 
             // 2. Compute normal cones
             compute_chart_normal_cones(*this);
