@@ -356,6 +356,10 @@ static __global__ void connect_new_vertices_kernel(
     const int* loop_bound_loop_ids,
     const size_t L,
     const size_t V,
+    const float3* vertices,
+    const int* edge2face,
+    const int* edge2face_offset,
+    const int3* existing_faces,
     int3* faces
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -366,7 +370,37 @@ static __global__ void connect_new_vertices_kernel(
     int e0 = int(e & 0xFFFFFFFF);
     int e1 = int(e >> 32);
     int new_v_id = loop_id + V;
-    faces[tid] = {e0, e1, new_v_id};
+
+    // Get the adjacent face to ensure correct orientation
+    // Boundary edges have exactly one adjacent face
+    int edge_idx = loop_boundary;
+    int adj_face_start = edge2face_offset[edge_idx];
+    int adj_face_idx = edge2face[adj_face_start];
+    int3 adj_face = existing_faces[adj_face_idx];
+
+    // Compute normal of adjacent face (pointing outward from mesh)
+    Vec3f v0_adj = Vec3f(vertices[adj_face.x]);
+    Vec3f v1_adj = Vec3f(vertices[adj_face.y]);
+    Vec3f v2_adj = Vec3f(vertices[adj_face.z]);
+    Vec3f adj_normal = (v1_adj - v0_adj).cross(v2_adj - v0_adj);
+
+    // Compute normal of candidate new face (e0, e1, new_v)
+    Vec3f v0 = Vec3f(vertices[e0]);
+    Vec3f v1 = Vec3f(vertices[e1]);
+    Vec3f v_new = Vec3f(vertices[new_v_id]);
+    Vec3f new_normal = (v1 - v0).cross(v_new - v0);
+
+    // Check if normals point in the same direction
+    // If dot product is negative, normals point in opposite directions, so flip the face
+    // We compare the sign without normalization since we only care about direction
+    float dot_product = adj_normal.dot(new_normal);
+    if (dot_product < 0.0f) {
+        // Normals point in opposite directions, flip the face by swapping e0 and e1
+        faces[tid] = {e1, e0, new_v_id};
+    } else {
+        // Normals point in the same direction, keep original orientation
+        faces[tid] = {e0, e1, new_v_id};
+    }
 }
 
 
@@ -607,6 +641,11 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_new_loop_boundaries_cnt));
 
+    // Ensure edge2face adjacency is available for orientation checking
+    if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
+        this->get_edge_face_adjacency();
+    }
+
     // Update mesh
     this->vertices.extend(new_num_bound_loops);
     this->faces.extend(new_num_loop_boundaries);
@@ -623,6 +662,10 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_new_loop_bound_loop_ids,
         new_num_loop_boundaries,
         V,
+        this->vertices.ptr,
+        this->edge2face.ptr,
+        this->edge2face_offset.ptr,
+        this->faces.ptr,
         this->faces.ptr + F
     );
     CUDA_CHECK(cudaGetLastError());
