@@ -33,6 +33,7 @@ void CuMesh::compute_face_areas() {
         this->face_areas.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 
@@ -66,6 +67,7 @@ void CuMesh::compute_face_normals() {
         this->face_normals.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 
@@ -124,6 +126,7 @@ void CuMesh::compute_vertex_normals() {
         this->vertex_normals.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 

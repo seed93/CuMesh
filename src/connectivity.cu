@@ -787,6 +787,7 @@ void CuMesh::get_manifold_boundary_adjacency() {
         this->manifold_bound_adj.ptr
     );
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFree(cu_manifold_vert_idx));
 }
 
 

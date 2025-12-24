@@ -492,6 +492,10 @@ void collapse_edges(
     );
     CUDA_CHECK(cudaGetLastError());
     swap_buffers(ctx.temp_storage, ctx.vertices);
+    
+    // Free the old vertices memory that is now in temp_storage
+    // We need to free it explicitly before resizing temp_storage for faces
+    ctx.temp_storage.free();
 
     // update faces buffer
     // get faces map
