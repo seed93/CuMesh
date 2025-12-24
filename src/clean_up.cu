@@ -564,6 +564,13 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaFree(cu_new_num_loop_boundaries));
     CUDA_CHECK(cudaFree(cu_loop_boundary_mask));
 
+    // Early return if no loop boundaries to process
+    if (new_num_loop_boundaries == 0) {
+        CUDA_CHECK(cudaFree(cu_new_loop_boundaries));
+        CUDA_CHECK(cudaFree(cu_new_loop_boundaries_cnt));
+        return;
+    }
+
     // Reconstruct new bound loops
     int* cu_new_loop_boundaries_offset;
     CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries_offset, (new_num_loop_boundaries+1) * sizeof(int)));
