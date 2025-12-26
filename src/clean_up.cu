@@ -354,6 +354,7 @@ static __global__ void connect_new_vertices_kernel(
     const uint64_t* edges,
     const int* loop_boundaries,
     const int* loop_bound_loop_ids,
+    const int* loop_boundaries_offset,
     const size_t L,
     const size_t V,
     const float3* vertices,
@@ -375,6 +376,15 @@ static __global__ void connect_new_vertices_kernel(
     // Boundary edges have exactly one adjacent face
     int edge_idx = loop_boundary;
     int adj_face_start = edge2face_offset[edge_idx];
+    int adj_face_end = edge2face_offset[edge_idx + 1];
+
+    // Boundary edges should have exactly one adjacent face
+    if (adj_face_end - adj_face_start != 1) {
+        // This is not a boundary edge, skip it
+        faces[tid] = {-1, -1, -1};
+        return;
+    }
+
     int adj_face_idx = edge2face[adj_face_start];
     int3 adj_face = existing_faces[adj_face_idx];
 
@@ -541,7 +551,7 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_bound_loop_mask));
-    CUDA_CHECK(cudaFree(cu_loop_bound_loop_ids));
+    CUDA_CHECK(cudaFree(cu_loop_bound_loop_ids));  // This is freed here, but...
 
     // Compress loop boundaries
     int *cu_new_loop_boundaries, *cu_new_num_loop_boundaries;
@@ -573,7 +583,7 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
 
     // Reconstruct new bound loops
     int* cu_new_loop_boundaries_offset;
-    CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries_offset, (new_num_loop_boundaries+1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&cu_new_loop_boundaries_offset, (new_num_bound_loops+1) * sizeof(int)));
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, temp_storage_bytes,
@@ -639,7 +649,6 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
         cu_new_loop_boundaries_offset + 1
     ));
     CUDA_CHECK(cudaFree(cu_new_loop_bound_centers));
-    CUDA_CHECK(cudaFree(cu_new_loop_boundaries_offset));
     inplace_div_kernel<<<(new_num_bound_loops+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
         cu_new_vertices,
         cu_new_loop_boundaries_cnt,
@@ -663,10 +672,12 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_new_vertices));
+
     connect_new_vertices_kernel<<<(new_num_loop_boundaries+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
         this->edges.ptr,
         cu_new_loop_boundaries,
         cu_new_loop_bound_loop_ids,
+        cu_new_loop_boundaries_offset,
         new_num_loop_boundaries,
         V,
         this->vertices.ptr,
@@ -678,6 +689,7 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_new_loop_boundaries));
     CUDA_CHECK(cudaFree(cu_new_loop_bound_loop_ids));
+    CUDA_CHECK(cudaFree(cu_new_loop_boundaries_offset));
 
     // Delete all cached info since mesh has changed
     this->clear_cache();
@@ -835,40 +847,84 @@ void CuMesh::repair_non_manifold_edges(){
 
 
 /**
- * Mark faces to remove for non-manifold edges
- * For each non-manifold edge (shared by >2 faces), only keep the first 2 faces
+ * Mark the smallest area face on each non-manifold edge for removal.
+ * MeshLab style: iteratively delete the smallest area face until edge becomes 2-manifold.
  *
  * @param edge2face: edge to face adjacency
  * @param edge2face_offset: edge to face adjacency offset
  * @param edge2face_cnt: number of faces per edge
+ * @param face_areas: area of each face
+ * @param face_keep_mask: mask indicating which faces are still valid (1 = valid)
  * @param E: number of edges
- * @param face_keep_mask: output mask (1 = keep, 0 = remove)
+ * @param face_to_remove: output mask for faces to remove in this iteration (1 = remove)
+ * @param has_non_manifold: output flag indicating if any non-manifold edge was found
  */
-static __global__ void mark_non_manifold_faces_kernel(
+static __global__ void mark_smallest_face_on_non_manifold_edges_kernel(
     const int* edge2face,
     const int* edge2face_offset,
     const int* edge2face_cnt,
+    const float* face_areas,
+    const uint8_t* face_keep_mask,
     const size_t E,
-    uint8_t* face_keep_mask
+    uint8_t* face_to_remove,
+    int* has_non_manifold
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
 
-    // Only process non-manifold edges (cnt > 2)
     int cnt = edge2face_cnt[tid];
     if (cnt <= 2) return;
 
-    // Mark faces beyond the first 2 for removal
     int start = edge2face_offset[tid];
-    for (int i = 2; i < cnt; i++) {
+
+    // Count valid faces on this edge and find the smallest one
+    int valid_count = 0;
+    int smallest_face_idx = -1;
+    float smallest_area = FLT_MAX;
+
+    for (int i = 0; i < cnt; i++) {
         int face_idx = edge2face[start + i];
-        face_keep_mask[face_idx] = 0;
+        if (face_keep_mask[face_idx]) {
+            valid_count++;
+            float area = face_areas[face_idx];
+            if (area < smallest_area) {
+                smallest_area = area;
+                smallest_face_idx = face_idx;
+            }
+        }
+    }
+
+    // If still non-manifold (> 2 valid faces), mark the smallest for removal
+    if (valid_count > 2 && smallest_face_idx >= 0) {
+        face_to_remove[smallest_face_idx] = 1;
+        atomicExch(has_non_manifold, 1);
+    }
+}
+
+/**
+ * Update face keep mask by removing marked faces
+ */
+static __global__ void update_face_keep_mask_kernel(
+    uint8_t* face_keep_mask,
+    const uint8_t* face_to_remove,
+    const size_t F
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= F) return;
+
+    if (face_to_remove[tid]) {
+        face_keep_mask[tid] = 0;
     }
 }
 
 
 void CuMesh::remove_non_manifold_faces() {
-    // Get edge-face adjacency information
+    // Compute face areas first
+    if (this->face_areas.is_empty()) {
+        this->compute_face_areas();
+    }
+
+    // Get edge-face adjacency (only once, we use mask to track valid faces)
     if (this->edge2face.is_empty() || this->edge2face_offset.is_empty()) {
         this->get_edge_face_adjacency();
     }
@@ -883,19 +939,56 @@ void CuMesh::remove_non_manifold_faces() {
     CUDA_CHECK(cudaMalloc(&cu_face_keep_mask, F * sizeof(uint8_t)));
     CUDA_CHECK(cudaMemset(cu_face_keep_mask, 1, F * sizeof(uint8_t)));
 
-    // Mark faces on non-manifold edges for removal
-    mark_non_manifold_faces_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
-        this->edge2face.ptr,
-        this->edge2face_offset.ptr,
-        this->edge2face_cnt.ptr,
-        E,
-        cu_face_keep_mask
-    );
-    CUDA_CHECK(cudaGetLastError());
+    // Temporary buffer for faces to remove in each iteration
+    uint8_t* cu_face_to_remove;
+    CUDA_CHECK(cudaMalloc(&cu_face_to_remove, F * sizeof(uint8_t)));
+
+    // Flag to check if we found any non-manifold edges
+    int* cu_has_non_manifold;
+    int h_has_non_manifold;
+    CUDA_CHECK(cudaMalloc(&cu_has_non_manifold, sizeof(int)));
+
+    // Iteratively remove smallest faces until all edges are 2-manifold
+    // Each iteration removes the smallest area face from each non-manifold edge
+    const int MAX_ITERATIONS = 1000;  // Safety limit
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        // Reset iteration buffers
+        CUDA_CHECK(cudaMemset(cu_face_to_remove, 0, F * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMemset(cu_has_non_manifold, 0, sizeof(int)));
+
+        // Mark smallest face on each non-manifold edge
+        // Note: edge2face adjacency is static; we use face_keep_mask to check validity
+        mark_smallest_face_on_non_manifold_edges_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+            this->edge2face.ptr,
+            this->edge2face_offset.ptr,
+            this->edge2face_cnt.ptr,
+            this->face_areas.ptr,
+            cu_face_keep_mask,
+            E,
+            cu_face_to_remove,
+            cu_has_non_manifold
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        // Check if any non-manifold edges were found
+        CUDA_CHECK(cudaMemcpy(&h_has_non_manifold, cu_has_non_manifold, sizeof(int), cudaMemcpyDeviceToHost));
+        if (!h_has_non_manifold) break;
+
+        // Update face_keep_mask: mark faces for removal
+        update_face_keep_mask_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+            cu_face_keep_mask,
+            cu_face_to_remove,
+            F
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     // Remove marked faces
     this->_remove_faces(cu_face_keep_mask);
+
     CUDA_CHECK(cudaFree(cu_face_keep_mask));
+    CUDA_CHECK(cudaFree(cu_face_to_remove));
+    CUDA_CHECK(cudaFree(cu_has_non_manifold));
 
     // Clear cache since mesh has changed
     this->clear_cache();
@@ -1207,6 +1300,226 @@ void CuMesh::unify_face_orientations() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaFree(cu_flipped));
     CUDA_CHECK(cudaFree(conn_comp_with_flip));
+}
+
+
+static __global__ void quantize_vertices_kernel(
+    const float3* vertices,
+    const size_t V,
+    const float inv_threshold,
+    int3* quantized_vertices
+) {
+    const int vid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vid >= V) return;
+
+    float3 v = vertices[vid];
+    quantized_vertices[vid] = make_int3(
+        __float2int_rd(v.x * inv_threshold),
+        __float2int_rd(v.y * inv_threshold),
+        __float2int_rd(v.z * inv_threshold)
+    );
+}
+
+
+static __global__ void find_merge_targets_kernel(
+    const int3* quantized_vertices_sorted,
+    const int* sorted_indices,
+    const float3* vertices,
+    const size_t V,
+    const float threshold_sq,
+    int* merge_map
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= V) return;
+
+    int vid = sorted_indices[tid];
+    int3 qv = quantized_vertices_sorted[tid];
+    float3 v = vertices[vid];
+
+    // Initialize to self
+    merge_map[vid] = vid;
+
+    // Check previous vertices in sorted order
+    for (int i = tid - 1; i >= 0; i--) {
+        int3 qv_other = quantized_vertices_sorted[i];
+
+        // If quantized vertices differ by more than 1 in any dimension, stop
+        if (abs(qv.x - qv_other.x) > 1 ||
+            abs(qv.y - qv_other.y) > 1 ||
+            abs(qv.z - qv_other.z) > 1) {
+            break;
+        }
+
+        int other_vid = sorted_indices[i];
+        float3 v_other = vertices[other_vid];
+
+        float dx = v.x - v_other.x;
+        float dy = v.y - v_other.y;
+        float dz = v.z - v_other.z;
+        float dist_sq = dx * dx + dy * dy + dz * dz;
+
+        if (dist_sq < threshold_sq) {
+            // Merge to the earlier vertex (smaller original index)
+            if (other_vid < merge_map[vid]) {
+                merge_map[vid] = other_vid;
+            }
+        }
+    }
+}
+
+
+static __global__ void compress_merge_map_kernel(
+    int* merge_map,
+    const size_t V
+) {
+    const int vid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vid >= V) return;
+
+    // Path compression: follow the chain to find the root
+    int root = merge_map[vid];
+    int max_depth = 100; // Prevent infinite loops
+    int depth = 0;
+
+    while (root != merge_map[root] && depth < max_depth) {
+        root = merge_map[root];
+        depth++;
+    }
+    merge_map[vid] = root;
+}
+
+
+static __global__ void update_faces_with_merge_map_kernel(
+    int3* faces,
+    const int* merge_map,
+    const size_t F
+) {
+    const int fid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (fid >= F) return;
+
+    int3 face = faces[fid];
+    faces[fid] = make_int3(
+        merge_map[face.x],
+        merge_map[face.y],
+        merge_map[face.z]
+    );
+}
+
+
+static __global__ void mark_degenerate_faces_kernel(
+    const int3* faces,
+    const size_t F,
+    uint8_t* face_mask
+) {
+    const int fid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (fid >= F) return;
+
+    int3 face = faces[fid];
+    // Mark face as valid (1) if all three vertices are different
+    face_mask[fid] = (face.x != face.y && face.y != face.z && face.z != face.x) ? 1 : 0;
+}
+
+
+void CuMesh::merge_close_vertices(float threshold) {
+    size_t V = this->vertices.size;
+    size_t F = this->faces.size;
+
+    if (V == 0 || F == 0) return;
+    if (threshold <= 0.0f) return;
+
+    float inv_threshold = 1.0f / threshold;
+    float threshold_sq = threshold * threshold;
+
+    // Step 1: Quantize vertices for spatial sorting
+    int3* cu_quantized_vertices;
+    CUDA_CHECK(cudaMalloc(&cu_quantized_vertices, V * sizeof(int3)));
+
+    quantize_vertices_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        this->vertices.ptr,
+        V,
+        inv_threshold,
+        cu_quantized_vertices
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 2: Sort vertices by quantized coordinates
+    int* cu_sorted_indices;
+    int* cu_sorted_indices_output;
+    int3* cu_quantized_vertices_output;
+    CUDA_CHECK(cudaMalloc(&cu_sorted_indices, V * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&cu_sorted_indices_output, V * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&cu_quantized_vertices_output, V * sizeof(int3)));
+
+    arange_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(cu_sorted_indices, V);
+    CUDA_CHECK(cudaGetLastError());
+
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_storage_bytes,
+        cu_quantized_vertices, cu_quantized_vertices_output,
+        cu_sorted_indices, cu_sorted_indices_output,
+        V,
+        int3_decomposer{}
+    ));
+    this->cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        this->cub_temp_storage.ptr, temp_storage_bytes,
+        cu_quantized_vertices, cu_quantized_vertices_output,
+        cu_sorted_indices, cu_sorted_indices_output,
+        V,
+        int3_decomposer{}
+    ));
+
+    CUDA_CHECK(cudaFree(cu_quantized_vertices));
+
+    // Step 3: Build merge map - find vertices to merge
+    int* cu_merge_map;
+    CUDA_CHECK(cudaMalloc(&cu_merge_map, V * sizeof(int)));
+
+    find_merge_targets_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        cu_quantized_vertices_output,
+        cu_sorted_indices_output,
+        this->vertices.ptr,
+        V,
+        threshold_sq,
+        cu_merge_map
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(cu_quantized_vertices_output));
+    CUDA_CHECK(cudaFree(cu_sorted_indices));
+    CUDA_CHECK(cudaFree(cu_sorted_indices_output));
+
+    // Step 4: Compress merge map (path compression)
+    compress_merge_map_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        cu_merge_map,
+        V
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 5: Update faces with merge map
+    update_faces_with_merge_map_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        this->faces.ptr,
+        cu_merge_map,
+        F
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(cu_merge_map));
+
+    // Step 6: Remove degenerate faces (faces with duplicate vertices)
+    uint8_t* cu_face_mask;
+    CUDA_CHECK(cudaMalloc(&cu_face_mask, F * sizeof(uint8_t)));
+
+    mark_degenerate_faces_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        this->faces.ptr,
+        F,
+        cu_face_mask
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 7: Remove invalid faces and unreferenced vertices
+    this->_remove_faces(cu_face_mask);
+    CUDA_CHECK(cudaFree(cu_face_mask));
 }
 
 

@@ -371,6 +371,19 @@ public:
     void remove_duplicate_faces();
 
     /**
+     * Merge close vertices.
+     * This function merges vertices that are within a given threshold distance.
+     * This function refreshes:
+     * - vertices
+     * - faces
+     * This function destroys:
+     * - All connectivity information
+     * 
+     * @param threshold The distance threshold for merging vertices.
+     */
+    void merge_close_vertices(float threshold);
+
+    /**
      * Fill holes.
      * This function requires:
      * - loop_boundaries

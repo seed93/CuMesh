@@ -273,9 +273,14 @@ class CuMesh:
         """
         self.cu_mesh.compute_face_normals()
         face_normals = self.cu_mesh.read_face_normals()
-        kept = (face_normals.isnan().sum(dim=1) == 0)
-        self.remove_faces(kept)
-        
+        eps = 1e-12
+
+        degenerate = (
+            torch.isnan(face_normals).any(dim=1) |
+            (face_normals.norm(dim=1) < eps)
+        )
+        self.remove_faces(~degenerate)
+
     def fill_holes(self, max_hole_perimeter: float=3e-2):
         """
         Fill holes in the mesh.
@@ -315,6 +320,16 @@ class CuMesh:
         """
         self.cu_mesh.unify_face_orientations()
     
+    def merge_close_vertices(self, threshold: float=1e-6):
+        """
+        Merge close vertices that have the same coordinates.
+
+        Args:
+            threshold: the threshold for merging vertices.
+        """
+        assert isinstance(threshold, float) and threshold > 0, "threshold must be a positive float"
+        self.cu_mesh.merge_close_vertices(threshold)
+
     def simplify(self, target_num_faces: int, verbose: bool=False, options: dict={}):
         """
         Simplifies the mesh using a fast approximation algorithm with gpu acceleration.
