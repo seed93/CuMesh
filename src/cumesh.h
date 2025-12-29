@@ -382,6 +382,10 @@ public:
      * @param threshold The distance threshold for merging vertices.
      */
     void merge_close_vertices(float threshold);
+    /**
+     * Remove degenerate faces.
+     */
+    void remove_degenerate_faces(float abs_thresh, float rel_thresh);
 
     /**
      * Fill holes.

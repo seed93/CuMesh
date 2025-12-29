@@ -267,20 +267,17 @@ class CuMesh:
         """
         self.cu_mesh.remove_duplicate_faces()
         
-    def remove_degenerate_faces(self):
+    def remove_degenerate_faces(self, abs_thresh: float=1e-24, rel_thresh: float=1e-12):
         """
         Remove degenerate faces from the mesh.
+
+        Args:
+            abs_thresh: absolute area threshold below which a face is considered degenerate.
+            rel_thresh: relative area to square of the longest edge threshold below which a face is considered degenerate.
+                Note that a face is considered degenerate if both the absolute and relative conditions are met.
         """
-        self.cu_mesh.compute_face_normals()
-        face_normals = self.cu_mesh.read_face_normals()
-        eps = 1e-12
-
-        degenerate = (
-            torch.isnan(face_normals).any(dim=1) |
-            (face_normals.norm(dim=1) < eps)
-        )
-        self.remove_faces(~degenerate)
-
+        self.cu_mesh.remove_degenerate_faces(abs_thresh, rel_thresh)
+        
     def fill_holes(self, max_hole_perimeter: float=3e-2):
         """
         Fill holes in the mesh.
