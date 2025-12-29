@@ -466,6 +466,23 @@ public:
      */
     std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
 
+    /**
+     * Collapse skinny/sliver faces iteratively.
+     * This function identifies faces with poor quality (small angles, high aspect ratio,
+     * or low shape quality) and collapses the shortest edge of each skinny face.
+     * This function refreshes:
+     * - vertices
+     * - faces
+     * This function destroys:
+     * - All connectivity information
+     * 
+     * @param min_angle_deg Minimum angle threshold in degrees (default 1). Faces with
+     *                      minimum angle below this are considered skinny.
+     * @param max_iterations Maximum number of collapse iterations (default 100).
+     * @return A tuple of the number of vertices and the number of faces after processing.
+     */
+    std::tuple<int, int> collapse_skinny_faces(float min_angle_deg = 1.0f, int max_iterations = 100);
+
 
     // Atlasing functions
 

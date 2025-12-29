@@ -60,6 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)
+        .def("collapse_skinny_faces", &cumesh::CuMesh::collapse_skinny_faces)
         .def("compute_charts", &cumesh::CuMesh::compute_charts)
         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
 
