@@ -370,6 +370,63 @@ class CuMesh:
             
         if verbose:
             pbar.close()
+
+    def collapse_skinny_faces(
+        self,
+        min_angle_deg: float = 1.0,
+        max_iterations: int = 100,
+        verbose: bool = False
+    ) -> Tuple[int, int]:
+        """
+        Collapse skinny/sliver faces to improve mesh quality.
+        
+        This function identifies faces with poor quality metrics (small minimum angle,
+        high aspect ratio, or low shape quality) and collapses the shortest edge of
+        each skinny face. This is useful for smoothing staircase patterns and removing
+        sliver triangles that can cause numerical issues.
+        
+        A face is considered "skinny" if ANY of these conditions are true:
+        - Minimum angle < min_angle_deg
+        - Aspect ratio (longest_edge / shortest_altitude) > 10
+        - Shape quality metric < 0.1 (where 1.0 = equilateral triangle)
+        
+        Args:
+            min_angle_deg: Minimum angle threshold in degrees. Faces with minimum
+                           angle below this value are considered skinny. Default: 15.0
+            max_iterations: Maximum number of collapse iterations. The algorithm
+                            stops early if no more skinny faces remain. Default: 100
+            verbose: If True, print progress information. Default: False
+            
+        Returns:
+            A tuple of (num_vertices, num_faces) after processing.
+            
+        Example:
+            >>> mesh = cumesh.CuMesh()
+            >>> mesh.init(vertices, faces)
+            >>> # Collapse faces with minimum angle < 20 degrees
+            >>> mesh.collapse_skinny_faces(min_angle_deg=20.0, max_iterations=50)
+            >>> new_vertices, new_faces = mesh.read()
+        """
+        assert isinstance(min_angle_deg, (int, float)) and min_angle_deg > 0, \
+            "min_angle_deg must be a positive number"
+        assert isinstance(max_iterations, int) and max_iterations > 0, \
+            "max_iterations must be a positive integer"
+        
+        initial_faces = self.cu_mesh.num_faces()
+        
+        if verbose:
+            pbar = tqdm(total=max_iterations, desc="Collapsing skinny faces")
+        
+        new_num_vert, new_num_face = self.cu_mesh.collapse_skinny_faces(
+            float(min_angle_deg), max_iterations
+        )
+        
+        if verbose:
+            pbar.update(max_iterations)
+            pbar.close()
+            print(f"Collapsed skinny faces: {initial_faces} -> {new_num_face} faces")
+        
+        return new_num_vert, new_num_face
             
     def compute_charts(
         self,
