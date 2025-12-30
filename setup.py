@@ -82,7 +82,7 @@ setup(
             }
         ),
         CUDAExtension(
-            name='cumesh._xatlas',
+            name='cumesh._cumesh_xatlas',
             sources=[
                 'third_party/xatlas/xatlas.cpp',
                 'third_party/xatlas/binding.cpp',
