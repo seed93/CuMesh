@@ -339,13 +339,15 @@ class CuMesh:
         assert isinstance(target_num_faces, int) and target_num_faces > 0, "target_num_faces must be a positive integer"
 
         num_face = self.cu_mesh.num_faces()
-        if num_face <= target_num_faces:
+        is_auto_face_limit = 'thresh' in options
+        if not is_auto_face_limit and num_face <= target_num_faces:
             return
         
         if verbose:
             pbar = tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose)
 
         thresh = options.get('thresh', 1e-8)
+        init_thresh = thresh
         lambda_edge_length = options.get('lambda_edge_length', 1e-2)
         lambda_skinny = options.get('lambda_skinny', 1e-3)
         while True:
@@ -357,11 +359,13 @@ class CuMesh:
             if verbose:
                 pbar.update(num_face - max(target_num_faces, new_num_face))
 
-            if new_num_face <= target_num_faces:
+            if (not is_auto_face_limit or thresh != init_thresh) and new_num_face <= target_num_faces:
                 break
             
             del_num_face = num_face - new_num_face
             if del_num_face / num_face < 1e-2:
+                if is_auto_face_limit and new_num_face <= target_num_faces:
+                    break
                 thresh *= 10
             num_face = new_num_face
             
