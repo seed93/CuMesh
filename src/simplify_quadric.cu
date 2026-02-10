@@ -8,6 +8,21 @@ namespace cumesh {
 
 
 // ============================================================================
+// Helper: fill array with value (avoids slow host-to-device Buffer::fill)
+// ============================================================================
+
+static __global__ void sq_fill_int_kernel(int* data, int val, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < N) data[tid] = val;
+}
+
+static void sq_fill_int(Buffer<int>& buf, int val) {
+    sq_fill_int_kernel<<<(buf.size + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        buf.ptr, val, (int)buf.size);
+}
+
+
+// ============================================================================
 // Helper: pack/unpack key-value for atomicMin conflict resolution
 // ============================================================================
 
@@ -695,7 +710,7 @@ static void compute_edge_cost_quadric(CuMesh& ctx) {
 
 
 // ============================================================================
-// Kernel 3: Propagate cost to neighboring faces (reuse pattern from simplify.cu)
+// Kernel 3: Propagate cost to neighboring faces
 // ============================================================================
 
 static __global__ void propagate_cost_quadric_kernel(
@@ -725,24 +740,6 @@ static __global__ void propagate_cost_quadric_kernel(
         atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]),
                   static_cast<unsigned long long>(cost));
     }
-}
-
-
-static void propagate_cost_quadric(CuMesh& ctx) {
-    size_t V = ctx.vertices.size;
-    size_t F = ctx.faces.size;
-    size_t E = ctx.edges.size;
-    ctx.propagated_costs.resize(F);
-    ctx.propagated_costs.fill(std::numeric_limits<uint64_t>::max());
-    propagate_cost_quadric_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        ctx.edges.ptr,
-        ctx.vert2face.ptr,
-        ctx.vert2face_offset.ptr,
-        ctx.edge_collapse_costs.ptr,
-        V, F, E,
-        ctx.propagated_costs.ptr
-    );
-    CUDA_CHECK(cudaGetLastError());
 }
 
 
@@ -877,7 +874,7 @@ static __global__ void sq_compress_qems_kernel(
 
 
 // ============================================================================
-// Host wrapper: Collapse edges and compress
+// Host wrapper: Single-round collapse + compress
 // ============================================================================
 
 static void collapse_edges_quadric(CuMesh& ctx, float collapse_thresh) {
@@ -887,9 +884,25 @@ static void collapse_edges_quadric(CuMesh& ctx, float collapse_thresh) {
 
     ctx.vertices_map.resize(V + 1);
     ctx.faces_map.resize(F + 1);
-    ctx.vertices_map.fill(1);
-    ctx.faces_map.fill(1);
+    sq_fill_int(ctx.vertices_map, 1);
+    sq_fill_int(ctx.faces_map, 1);
 
+    // Propagated costs (memset 0xFF = UINT64_MAX, faster than host-to-device copy)
+    ctx.propagated_costs.resize(F);
+    CUDA_CHECK(cudaMemset(ctx.propagated_costs.ptr, 0xFF, F * sizeof(uint64_t)));
+
+    // Propagate: each edge claims its incident faces
+    propagate_cost_quadric_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        ctx.edges.ptr,
+        ctx.vert2face.ptr,
+        ctx.vert2face_offset.ptr,
+        ctx.edge_collapse_costs.ptr,
+        V, F, E,
+        ctx.propagated_costs.ptr
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Collapse: edges that won all their incident faces
     collapse_edges_quadric_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         ctx.vertices.ptr,
         ctx.faces.ptr,
@@ -1048,58 +1061,74 @@ void CuMesh::set_simplify_quadric_params(
 
 
 // ============================================================================
+// Histogram-based k-th percentile: O(n) instead of O(n log n) sort
+// ============================================================================
+
+static __global__ void sq_histogram_kernel(
+    const float* costs,
+    const int E,
+    const float min_val,
+    const float inv_range,
+    const int num_buckets,
+    int* histogram
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= E) return;
+    float c = costs[tid];
+    if (!isfinite(c)) return;  // skip INFINITY
+    int bucket = min((int)((c - min_val) * inv_range * num_buckets), num_buckets - 1);
+    bucket = max(0, bucket);
+    atomicAdd(&histogram[bucket], 1);
+}
+
+
+// ============================================================================
 // simplify_quadric_step: orchestrate one round of MeshLab-quality simplification
+//
+// Performance optimizations:
+// 1. Skip edge_face_adjacency & vertex_edge_adjacency after first step (only init_quadric needs them)
+// 2. Auto-scale aggressiveness: higher when far from target, lower when close
+// 3. Histogram-based threshold (O(n) vs O(n log n) sort)
+// 4. Fast GPU fills (cudaMemset + custom kernels)
 // ============================================================================
 
 std::tuple<int, int> CuMesh::simplify_quadric_step(int target_num_faces, float threshold, bool timing) {
     std::chrono::high_resolution_clock::time_point start, end;
 
     bool use_adaptive = (target_num_faces > 0);
+    bool need_full_adjacency = !this->qems_initialized;  // only first step
 
-    // 1. Build all adjacency (needed every step for cost computation and collapse)
+    // 1. Build adjacency
     if (timing) start = std::chrono::high_resolution_clock::now();
     this->get_vertex_face_adjacency();
-    if (timing) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] get_vertex_face_adjacency: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
-    }
-
-    if (timing) start = std::chrono::high_resolution_clock::now();
     this->get_edges();
     this->get_boundary_info();
     if (timing) {
         CUDA_CHECK(cudaDeviceSynchronize());
         end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] get_edges + get_boundary_info: "
+        std::cout << "  [quadric] core adjacency: "
                   << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
     }
 
-    if (timing) start = std::chrono::high_resolution_clock::now();
-    this->get_edge_face_adjacency();
-    this->get_vertex_edge_adjacency();
-    if (timing) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] get_edge_face_adjacency + get_vertex_edge_adjacency: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
+    // edge_face_adjacency & vertex_edge_adjacency only needed for init_quadric (first step)
+    if (need_full_adjacency) {
+        if (timing) start = std::chrono::high_resolution_clock::now();
+        this->get_edge_face_adjacency();
+        this->get_vertex_edge_adjacency();
+        if (timing) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            end = std::chrono::high_resolution_clock::now();
+            std::cout << "  [quadric] full adjacency (first step only): "
+                      << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
+        }
     }
 
-    // 2+3. First step: compute scale factor and initialize QEMs.
-    //       Subsequent steps: reuse accumulated QEMs (matching MeshLab behavior).
-    //       QEM accumulation (Q[surviving] += Q[deleted]) preserves the original
-    //       surface information, making high-curvature regions more expensive to
-    //       simplify and creating proper adaptive density.
-    //       Double-precision QEMs ensure the edge-length tiebreaker works in flat
-    //       areas (float noise ~1e-7 overwhelms eps=1e-15, double noise ~1e-30 does not).
+    // 2. First step: compute scale factor and initialize QEMs
     if (!this->qems_initialized) {
-        // Compute ScaleFactor if ScaleIndependent (one-time)
         if (simplify_quadric_params.ScaleIndependent) {
             size_t V = this->vertices.size;
             std::vector<float3> h_verts(V);
             CUDA_CHECK(cudaMemcpy(h_verts.data(), this->vertices.ptr, V * sizeof(float3), cudaMemcpyDeviceToHost));
-
             float3 h_min, h_max;
             h_min = h_max = h_verts[0];
             for (size_t i = 1; i < V; i++) {
@@ -1110,10 +1139,7 @@ std::tuple<int, int> CuMesh::simplify_quadric_step(int target_num_faces, float t
                 h_max.y = std::max(h_max.y, h_verts[i].y);
                 h_max.z = std::max(h_max.z, h_verts[i].z);
             }
-
-            float dx = h_max.x - h_min.x;
-            float dy = h_max.y - h_min.y;
-            float dz = h_max.z - h_min.z;
+            float dx = h_max.x - h_min.x, dy = h_max.y - h_min.y, dz = h_max.z - h_min.z;
             float diag = sqrtf(dx * dx + dy * dy + dz * dz);
             if (diag > 1e-20f) {
                 double inv_diag = 1.0 / static_cast<double>(diag);
@@ -1122,120 +1148,130 @@ std::tuple<int, int> CuMesh::simplify_quadric_step(int target_num_faces, float t
                 simplify_quadric_params.ScaleFactor = 1.0f;
             }
         }
-
-        // Initialize QEMs from current geometry (first step only)
         if (timing) start = std::chrono::high_resolution_clock::now();
         init_quadric(*this);
         if (timing) {
             CUDA_CHECK(cudaDeviceSynchronize());
             end = std::chrono::high_resolution_clock::now();
-            std::cout << "  [quadric] init_quadric (first step): "
+            std::cout << "  [quadric] init_quadric: "
                       << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
         }
-
         this->qems_initialized = true;
     }
-    // On subsequent steps: vertex_qems already contains accumulated QEMs
-    // from previous collapses (compressed alongside vertices).
 
-    // 4. Compute edge collapse costs
+    // 3. Compute edge collapse costs
     if (timing) start = std::chrono::high_resolution_clock::now();
     compute_edge_cost_quadric(*this);
     if (timing) {
         CUDA_CHECK(cudaDeviceSynchronize());
         end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] compute_edge_cost_quadric: "
+        std::cout << "  [quadric] compute_edge_cost: "
                   << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
     }
 
-    // 5. Compute effective collapse threshold
+    // 4. Compute effective collapse threshold using histogram (O(n) vs O(n log n) sort)
     size_t E = this->edges.size;
     size_t F = this->faces.size;
     float effective_thresh = threshold;
 
     if (use_adaptive) {
-        // Sort edge costs to find the adaptive threshold at a controlled percentile.
-        // This limits how many edges can collapse per step, mimicking MeshLab's
-        // sequential "always collapse the globally cheapest edge" behavior.
         if (timing) start = std::chrono::high_resolution_clock::now();
 
-        float aggressiveness = simplify_quadric_params.Aggressiveness;
-
-        // Compute how many edges we want eligible this step:
-        // - Each edge collapse removes ~2 faces, conflict resolution allows ~50%
-        //   of eligible edges, so N eligible → ~N faces removed
-        // - Limit by aggressiveness fraction of total edges
-        // - Also limit by remaining faces to remove
+        // Auto-scale aggressiveness: higher when far from target, lower when close.
+        // This reduces the total number of steps needed, saving adjacency rebuild cost.
+        float base_aggressiveness = simplify_quadric_params.Aggressiveness;
         int faces_to_remove = std::max(0, (int)F - target_num_faces);
+        float remaining_ratio = (float)faces_to_remove / (float)F;
+        // Ramp: 1x at target → up to 10x when 100% remains to remove
+        float auto_scale = 1.0f + 9.0f * remaining_ratio;
+        float aggressiveness = std::min(base_aggressiveness * auto_scale, 0.3f);
+
         int max_eligible = std::max(1, std::min(
             (int)(E * aggressiveness),
             faces_to_remove
         ));
         max_eligible = std::min(max_eligible, (int)E);
 
-        // Sort a copy of edge costs using CUB radix sort
-        Buffer<float> costs_in, costs_out;
-        costs_in.resize(E);
-        costs_out.resize(E);
-        CUDA_CHECK(cudaMemcpy(costs_in.ptr, this->edge_collapse_costs.ptr,
-                              E * sizeof(float), cudaMemcpyDeviceToDevice));
-
-        size_t sort_temp_bytes = 0;
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            nullptr, sort_temp_bytes, costs_in.ptr, costs_out.ptr, (int)E));
-        this->cub_temp_storage.resize(sort_temp_bytes);
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            this->cub_temp_storage.ptr, sort_temp_bytes,
-            costs_in.ptr, costs_out.ptr, (int)E));
-
-        // Read the cost at the target percentile index
-        float adaptive_thresh;
-        int thresh_idx = std::min(max_eligible - 1, (int)E - 1);
-        CUDA_CHECK(cudaMemcpy(&adaptive_thresh, costs_out.ptr + thresh_idx,
-                              sizeof(float), cudaMemcpyDeviceToHost));
-
-        costs_in.free();
-        costs_out.free();
-
-        // Ensure we never use INFINITY as threshold (would allow invalid collapses)
-        if (!std::isfinite(adaptive_thresh)) {
-            adaptive_thresh = 1e30f;
+        // Find min cost using CUB reduction
+        float min_cost;
+        {
+            Buffer<float> d_min_buf;
+            d_min_buf.resize(1);
+            size_t temp_bytes = 0;
+            CUDA_CHECK(cub::DeviceReduce::Min(nullptr, temp_bytes,
+                this->edge_collapse_costs.ptr, d_min_buf.ptr, (int)E));
+            this->cub_temp_storage.resize(temp_bytes);
+            CUDA_CHECK(cub::DeviceReduce::Min(this->cub_temp_storage.ptr, temp_bytes,
+                this->edge_collapse_costs.ptr, d_min_buf.ptr, (int)E));
+            CUDA_CHECK(cudaMemcpy(&min_cost, d_min_buf.ptr, sizeof(float), cudaMemcpyDeviceToHost));
+            d_min_buf.free();
         }
 
-        // Effective threshold is the minimum of adaptive and external
-        effective_thresh = std::min(adaptive_thresh, threshold);
+        if (std::isfinite(min_cost) && min_cost < 1e30f) {
+            // Histogram to find the k-th percentile threshold
+            const int NUM_BUCKETS = 1024;
+            Buffer<int> histogram;
+            histogram.resize(NUM_BUCKETS);
+
+            // Cost range: most meaningful costs are within a few orders of magnitude of min
+            float max_cost = min_cost * 1e6f;
+            if (max_cost < 1e-30f) max_cost = 1.0f;
+            float range = max_cost - min_cost;
+            if (range < 1e-30f) range = 1e-30f;
+            float inv_range = 1.0f / range;
+
+            histogram.zero();
+            sq_histogram_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+                this->edge_collapse_costs.ptr, (int)E,
+                min_cost, inv_range, NUM_BUCKETS,
+                histogram.ptr
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // Read histogram to host and find the bucket containing the k-th element
+            std::vector<int> h_hist(NUM_BUCKETS);
+            CUDA_CHECK(cudaMemcpy(h_hist.data(), histogram.ptr, NUM_BUCKETS * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            histogram.free();
+
+            int cumsum = 0;
+            int target_bucket = NUM_BUCKETS - 1;
+            for (int b = 0; b < NUM_BUCKETS; b++) {
+                cumsum += h_hist[b];
+                if (cumsum >= max_eligible) {
+                    target_bucket = b;
+                    break;
+                }
+            }
+
+            // Threshold = upper boundary of the target bucket
+            float adaptive_thresh = min_cost + (target_bucket + 1) * range / NUM_BUCKETS;
+            if (!std::isfinite(adaptive_thresh)) adaptive_thresh = 1e30f;
+            effective_thresh = std::min(adaptive_thresh, threshold);
+        }
 
         if (timing) {
             CUDA_CHECK(cudaDeviceSynchronize());
             end = std::chrono::high_resolution_clock::now();
-            std::cout << "  [quadric] adaptive_threshold (sort): "
+            std::cout << "  [quadric] adaptive_threshold: "
                       << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
-                      << " us, thresh=" << effective_thresh
+                      << " us, aggr=" << aggressiveness
+                      << ", thresh=" << effective_thresh
                       << ", max_eligible=" << max_eligible << std::endl;
         }
     }
 
-    // 6. Propagate costs to faces
-    if (timing) start = std::chrono::high_resolution_clock::now();
-    propagate_cost_quadric(*this);
-    if (timing) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] propagate_cost_quadric: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
-    }
-
-    // 7. Collapse edges and compress
+    // 5. Collapse + compress
     if (timing) start = std::chrono::high_resolution_clock::now();
     collapse_edges_quadric(*this, effective_thresh);
     if (timing) {
         CUDA_CHECK(cudaDeviceSynchronize());
         end = std::chrono::high_resolution_clock::now();
-        std::cout << "  [quadric] collapse_edges_quadric: "
+        std::cout << "  [quadric] collapse: "
                   << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
     }
 
-    // Delete all cached info since mesh has changed
+    // Delete cached adjacency since mesh changed
     this->clear_cache();
 
     return std::make_tuple(static_cast<int>(this->vertices.size), static_cast<int>(this->faces.size));

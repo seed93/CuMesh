@@ -3,7 +3,7 @@ import math
 import torch
 from tqdm import tqdm
 from .xatlas import Atlas
-from .develop import _C
+from . import _C
 
 
 class CuMesh:

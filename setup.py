@@ -42,6 +42,7 @@ setup(
                 "src/geometry.cu",
                 "src/io.cu",
                 "src/simplify.cu",
+                "src/simplify_quadric.cu",
                 "src/skinny_collapse.cu",
                 "src/shared.cu",
                 
