@@ -36,12 +36,17 @@ struct __align__(16) Vec3f {
 
 /**
  * QEM (Quadric Error Metric) class for mesh simplification.
+ * Uses double precision to match MeshLab's accuracy.
+ * Double precision is critical for the edge-length tiebreaker in flat areas:
+ * with float, QEM noise (~1e-7) overwhelms QuadricEpsilon (1e-15), preventing
+ * the tiebreaker from activating. With double, noise is ~1e-15, allowing
+ * proper edge-length ordering that creates adaptive density.
  */
 struct __align__(16) QEM
 {
     // store upper triangle of symmetric 4x4 matrix:
     // e = [ 00, 01, 02, 03, 11, 12, 13, 22, 23, 33 ]
-    float e[10];
+    double e[10];
 
     __device__ __forceinline__ QEM();
     __device__ __forceinline__ QEM operator+(const QEM& o) const;
@@ -50,7 +55,7 @@ struct __align__(16) QEM
     __device__ __forceinline__ QEM& operator-=(const QEM& o);
     __device__ __forceinline__ void zero();
     __device__ __forceinline__ void add_plane(float4 p);
-    __device__ __forceinline__ float evaluate(const Vec3f& p) const;
+    __device__ __forceinline__ double evaluate(const Vec3f& p) const;
     __device__ __forceinline__ bool solve_optimal(float3 &out, float &err) const;
 };
 
@@ -205,24 +210,14 @@ __device__ __forceinline__ QEM& QEM::operator-=(const QEM& o) {
 
 __device__ __forceinline__ void QEM::zero() {
     #pragma unroll
-    for (int i = 0; i < 10; ++i) e[i] = 0.0f;
+    for (int i = 0; i < 10; ++i) e[i] = 0.0;
 }
 
 
 // Add plane p = (a,b,c,d) as outer product p * p^T
+// Float plane equation is promoted to double for accumulation precision
 __device__ __forceinline__ void QEM::add_plane(float4 p) {
-    // upper triangle indices mapping:
-    // (0,0)->e[0]
-    // (0,1)->e[1]
-    // (0,2)->e[2]
-    // (0,3)->e[3]
-    // (1,1)->e[4]
-    // (1,2)->e[5]
-    // (1,3)->e[6]
-    // (2,2)->e[7]
-    // (2,3)->e[8]
-    // (3,3)->e[9]
-    float a = p.x, b = p.y, c = p.z, d = p.w;
+    double a = (double)p.x, b = (double)p.y, c = (double)p.z, d = (double)p.w;
     e[0] += a * a;
     e[1] += a * b;
     e[2] += a * c;
@@ -237,86 +232,61 @@ __device__ __forceinline__ void QEM::add_plane(float4 p) {
 
 
 // Evaluate v^T * Q * v for v = (x,y,z,1)
-__device__ __forceinline__ float QEM::evaluate(const Vec3f& p) const {
-    // compute v = [x,y,z,1]
-    float x = p.x, y = p.y, z = p.z, w = 1.0f;
-    // expand symmetric multiplication using stored upper triangular
-    // result = sum_{i<=j} M_ij * v_i * v_j * (1 if i==j else 2)
-    float res = 0.0f;
-    // (0,0)
+// Returns double for full precision (critical for edge-length tiebreaker in flat areas)
+__device__ __forceinline__ double QEM::evaluate(const Vec3f& p) const {
+    double x = (double)p.x, y = (double)p.y, z = (double)p.z, w = 1.0;
+    double res = 0.0;
     res += e[0] * x * x;
-    // (0,1) and (1,0)
-    res += 2.0f * e[1] * x * y;
-    // (0,2)
-    res += 2.0f * e[2] * x * z;
-    // (0,3)
-    res += 2.0f * e[3] * x * w;
-    // (1,1)
+    res += 2.0 * e[1] * x * y;
+    res += 2.0 * e[2] * x * z;
+    res += 2.0 * e[3] * x * w;
     res += e[4] * y * y;
-    // (1,2)
-    res += 2.0f * e[5] * y * z;
-    // (1,3)
-    res += 2.0f * e[6] * y * w;
-    // (2,2)
+    res += 2.0 * e[5] * y * z;
+    res += 2.0 * e[6] * y * w;
     res += e[7] * z * z;
-    // (2,3)
-    res += 2.0f * e[8] * z * w;
-    // (3,3)
+    res += 2.0 * e[8] * z * w;
     res += e[9] * w * w;
     return res;
 }
 
 
 // Try to solve for optimal point minimizing v^T Q v with constraint v = (x,y,z,1)
-// Solve the linear system: A * [x y z]^T = -b, where
-// A = top-left 3x3 of Q, b = [e03, e13, e23] (note signs)
-// Return true if solved (matrix invertible), false otherwise. err returns the error at the solution.
+// Uses double precision internally for numerical stability
 __device__ __forceinline__ bool QEM::solve_optimal(float3 &out, float &err) const {
-    // Build A (symmetric)
-    float A00 = e[0];
-    float A01 = e[1];
-    float A02 = e[2];
-    float A11 = e[4];
-    float A12 = e[5];
-    float A22 = e[7];
-    // b = (e03, e13, e23) where e03=e[3], e13=e[6], e23=e[8]
-    float b0 = e[3];
-    float b1 = e[6];
-    float b2 = e[8];
+    // Build A (symmetric) in double
+    double A00 = e[0], A01 = e[1], A02 = e[2];
+    double A11 = e[4], A12 = e[5], A22 = e[7];
+    double b0 = e[3], b1 = e[6], b2 = e[8];
 
-    // Solve A * x = -b
-    // Use analytic inverse for 3x3 symmetric matrix (compute determinant)
     // Compute determinant
-    float det =
+    double det =
         A00 * (A11 * A22 - A12 * A12) -
         A01 * (A01 * A22 - A12 * A02) +
         A02 * (A01 * A12 - A11 * A02);
 
-    if (fabsf(det) < 1e-12f) {
-        // singular - fall back: pick minimal among corners (or average 0)
-        // Here choose to put out as (0,0,0)
+    if (fabs(det) < 1e-20) {
         out = make_float3(0.0f, 0.0f, 0.0f);
-        err = evaluate(out);
+        err = (float)evaluate(Vec3f(0.0f, 0.0f, 0.0f));
         return false;
     }
 
-    float invDet = 1.0f / det;
+    double invDet = 1.0 / det;
 
     // Compute inverse(A) via adjugate
-    float inv00 =  (A11 * A22 - A12 * A12) * invDet;
-    float inv01 = -(A01 * A22 - A12 * A02) * invDet;
-    float inv02 =  (A01 * A12 - A11 * A02) * invDet;
-    float inv11 =  (A00 * A22 - A02 * A02) * invDet;
-    float inv12 = -(A00 * A12 - A01 * A02) * invDet;
-    float inv22 =  (A00 * A11 - A01 * A01) * invDet;
+    double inv00 =  (A11 * A22 - A12 * A12) * invDet;
+    double inv01 = -(A01 * A22 - A12 * A02) * invDet;
+    double inv02 =  (A01 * A12 - A11 * A02) * invDet;
+    double inv11 =  (A00 * A22 - A02 * A02) * invDet;
+    double inv12 = -(A00 * A12 - A01 * A02) * invDet;
+    double inv22 =  (A00 * A11 - A01 * A01) * invDet;
 
     // x = -inv(A) * b
-    float x = -(inv00 * b0 + inv01 * b1 + inv02 * b2);
-    float y = -(inv01 * b0 + inv11 * b1 + inv12 * b2);
-    float z = -(inv02 * b0 + inv12 * b1 + inv22 * b2);
+    double x = -(inv00 * b0 + inv01 * b1 + inv02 * b2);
+    double y = -(inv01 * b0 + inv11 * b1 + inv12 * b2);
+    double z = -(inv02 * b0 + inv12 * b1 + inv22 * b2);
 
-    out = make_float3(x, y, z);
-    err = evaluate(out);
+    out = make_float3((float)x, (float)y, (float)z);
+    err = (float)evaluate(Vec3f(out));
     return true;
 }
 

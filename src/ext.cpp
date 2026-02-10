@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <limits>
 #include "hash/api.h"
 #include "cumesh.h"
 #include "remesh/api.h"
@@ -61,6 +62,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)
         .def("collapse_skinny_faces", &cumesh::CuMesh::collapse_skinny_faces)
+        .def("set_simplify_quadric_params", &cumesh::CuMesh::set_simplify_quadric_params)
+        .def("simplify_quadric_step", &cumesh::CuMesh::simplify_quadric_step,
+             py::arg("target_num_faces"),
+             py::arg("threshold") = std::numeric_limits<float>::infinity(),
+             py::arg("timing") = false)
         .def("compute_charts", &cumesh::CuMesh::compute_charts)
         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
 

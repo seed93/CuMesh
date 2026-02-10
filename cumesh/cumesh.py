@@ -3,7 +3,7 @@ import math
 import torch
 from tqdm import tqdm
 from .xatlas import Atlas
-from . import _C
+from .develop import _C
 
 
 class CuMesh:
@@ -369,6 +369,101 @@ class CuMesh:
                 thresh *= 10
             num_face = new_num_face
             
+        if verbose:
+            pbar.close()
+
+    def simplify_quadric(self, target_num_faces: int, verbose: bool=False, options: dict={}):
+        """
+        Simplifies the mesh using MeshLab-quality quadric error metric with GPU acceleration.
+        Preserves hard edges, boundary features, and mesh quality.
+
+        Uses adaptive per-step threshold selection (sort edge costs, allow only the cheapest
+        fraction to collapse per step) combined with QEM accumulation across steps. This mimics
+        MeshLab's sequential "always collapse the globally cheapest edge" behavior, producing
+        adaptive density that preserves detail in high-curvature regions.
+
+        Args:
+            target_num_faces: the target number of faces to simplify to.
+            verbose: whether to print the progress of the simplification.
+            options: a dictionary of options for the simplification algorithm.
+                Supported options (matching MeshLab parameter names):
+                - BoundaryQuadricWeight (float, default 0.5): weight for boundary edge quadrics.
+                - FastPreserveBoundary (bool, default False): prevent collapsing boundary edges entirely.
+                - PreserveBoundary (bool, default False): same as FastPreserveBoundary but with cleanup.
+                - OptimalPlacement (bool, default True): compute optimal vertex position via quadric minimization.
+                - QuadricEpsilon (float, default 1e-15): epsilon for quadric computation.
+                - UseArea (bool, default True): weight face quadrics by area.
+                - ScaleIndependent (bool, default True): normalize quadric error by bounding box diagonal.
+                - QualityCheck (bool, default True): penalize collapses that create low-quality faces.
+                - QualityThr (float, default 0.3): quality threshold for penalty.
+                - HardQualityCheck (bool, default False): reject collapses below quality threshold.
+                - HardQualityThr (float, default 0.1): hard quality threshold.
+                - QualityQuadric (bool, default False): add quality quadrics for all edges.
+                - QualityQuadricWeight (float, default 0.001): weight for quality quadrics.
+                - NormalCheck (bool, default False): penalize normal changes.
+                - NormalThrRad (float, default pi/2): normal change threshold in radians.
+                - HardNormalCheck (bool, default False): reject face-flipping collapses.
+                - AreaCheck (bool, default False): reject collapses that change area significantly.
+                - PreserveTopology (bool, default False): check link conditions to prevent topology changes.
+                - Aggressiveness (float, default 0.05): fraction of edges eligible per step.
+                    Lower = smoother/closer to MeshLab (0.01), higher = faster (0.2).
+        """
+        assert isinstance(target_num_faces, int) and target_num_faces > 0, "target_num_faces must be a positive integer"
+
+        num_face = self.cu_mesh.num_faces()
+        if num_face <= target_num_faces:
+            return
+
+        # Set quadric simplification parameters (also resets QEM accumulation)
+        self.cu_mesh.set_simplify_quadric_params(
+            float(options.get('BoundaryQuadricWeight', 0.5)),
+            bool(options.get('FastPreserveBoundary', False)),
+            bool(options.get('PreserveBoundary', False)),
+            bool(options.get('OptimalPlacement', True)),
+            float(options.get('QuadricEpsilon', 1e-15)),
+            bool(options.get('UseArea', True)),
+            bool(options.get('ScaleIndependent', True)),
+            bool(options.get('QualityCheck', True)),
+            float(options.get('QualityThr', 0.3)),
+            bool(options.get('HardQualityCheck', False)),
+            float(options.get('HardQualityThr', 0.1)),
+            bool(options.get('QualityQuadric', False)),
+            float(options.get('QualityQuadricWeight', 0.001)),
+            bool(options.get('NormalCheck', False)),
+            float(options.get('NormalThrRad', math.pi / 2.0)),
+            bool(options.get('HardNormalCheck', False)),
+            bool(options.get('AreaCheck', False)),
+            bool(options.get('PreserveTopology', False)),
+            float(options.get('Aggressiveness', 0.05)),
+        )
+
+        if verbose:
+            pbar = tqdm(total=num_face - target_num_faces, desc="Simplifying (quadric)", disable=not verbose)
+
+        stall_count = 0
+        while num_face > target_num_faces:
+            # Adaptive mode: C++ internally sorts edge costs and limits per-step collapses
+            new_num_vert, new_num_face = self.cu_mesh.simplify_quadric_step(target_num_faces)
+
+            if verbose:
+                pbar.update(num_face - max(target_num_faces, new_num_face))
+
+            if new_num_face <= target_num_faces:
+                break
+
+            # Check for stall (no progress)
+            if new_num_face >= num_face:
+                stall_count += 1
+                if stall_count >= 3:
+                    # Truly stuck (e.g., topology/quality constraints prevent further collapse)
+                    if verbose:
+                        print(f"\n  [quadric] Stalled at {new_num_face} faces, cannot reach target {target_num_faces}")
+                    break
+            else:
+                stall_count = 0
+
+            num_face = new_num_face
+
         if verbose:
             pbar.close()
 

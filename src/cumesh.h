@@ -3,14 +3,60 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <limits>
 
 #include "utils.h"
 
 
 #define BLOCK_SIZE 256
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 
 namespace cumesh {
+
+
+/**
+ * Parameters for MeshLab-quality quadric simplification.
+ * Mirrors TriEdgeCollapseQuadricParameter from VCGLib.
+ */
+struct SimplifyQuadricParams {
+    float BoundaryQuadricWeight = 0.5f;
+    bool  FastPreserveBoundary  = false;
+    bool  PreserveBoundary      = false;
+    bool  OptimalPlacement      = true;
+    float QuadricEpsilon        = 1e-15f;
+    bool  UseArea               = true;
+    bool  ScaleIndependent      = true;
+    float ScaleFactor           = 1.0f;
+
+    // Quality checks
+    bool  QualityCheck          = true;
+    float QualityThr            = 0.3f;
+    bool  HardQualityCheck      = false;
+    float HardQualityThr        = 0.1f;
+    bool  QualityQuadric        = false;
+    float QualityQuadricWeight  = 0.001f;
+
+    // Normal checks
+    bool  NormalCheck           = false;
+    float NormalThrRad          = static_cast<float>(M_PI / 2.0);
+    float CosineThr             = 0.0f;    // cos(NormalThrRad), computed at init
+    bool  HardNormalCheck       = false;
+
+    // Area check
+    bool  AreaCheck             = false;
+
+    // Topology preservation
+    bool  PreserveTopology      = false;
+
+    // Adaptive collapse control
+    // Fraction of edges eligible per step (lower = smoother, closer to MeshLab; higher = faster)
+    float Aggressiveness        = 0.05f;
+};
+
 
 class CuMesh {
 public:
@@ -57,6 +103,12 @@ public:
     // Simplification
     Buffer<float> edge_collapse_costs;
     Buffer<uint64_t> propagated_costs;
+
+    // Quadric Simplification (MeshLab-quality)
+    SimplifyQuadricParams simplify_quadric_params;
+    Buffer<float3> quadric_optimal_positions;  // optimal collapse position per edge
+    Buffer<char> vertex_qems;                  // per-vertex double-precision QEM buffer (accumulated across steps, like MeshLab)
+    bool qems_initialized = false;             // tracks whether ScaleFactor + initial QEMs have been computed
 
     // Atlasing
     int atlas_num_charts;
@@ -482,6 +534,50 @@ public:
      * @return A tuple of the number of vertices and the number of faces after processing.
      */
     std::tuple<int, int> collapse_skinny_faces(float min_angle_deg = 1.0f, int max_iterations = 100);
+
+    /**
+     * Set parameters for MeshLab-quality quadric simplification.
+     * 
+     * @param params A Python dict with parameter names matching SimplifyQuadricParams fields.
+     */
+    void set_simplify_quadric_params(
+        float BoundaryQuadricWeight,
+        bool  FastPreserveBoundary,
+        bool  PreserveBoundary,
+        bool  OptimalPlacement,
+        float QuadricEpsilon,
+        bool  UseArea,
+        bool  ScaleIndependent,
+        bool  QualityCheck,
+        float QualityThr,
+        bool  HardQualityCheck,
+        float HardQualityThr,
+        bool  QualityQuadric,
+        float QualityQuadricWeight,
+        bool  NormalCheck,
+        float NormalThrRad,
+        bool  HardNormalCheck,
+        bool  AreaCheck,
+        bool  PreserveTopology,
+        float Aggressiveness
+    );
+
+    /**
+     * Run one step of MeshLab-quality quadric edge collapse.
+     * This function refreshes:
+     * - vertices
+     * - faces
+     * This function destroys:
+     * - All connectivity information
+     * 
+     * @param target_num_faces Target face count. When > 0, uses adaptive threshold
+     *        (sort edge costs and only allow cheapest fraction to collapse per step).
+     *        Pass 0 to disable adaptive mode and rely only on threshold.
+     * @param threshold Maximum acceptable quadric error for collapse (upper bound).
+     * @param timing If true, print timing information.
+     * @return A tuple of the number of vertices and the number of faces after simplification.
+     */
+    std::tuple<int, int> simplify_quadric_step(int target_num_faces, float threshold = std::numeric_limits<float>::infinity(), bool timing = false);
 
 
     // Atlasing functions
