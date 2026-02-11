@@ -39,6 +39,10 @@ CuMesh::~CuMesh() {
     edge_collapse_costs.free();
     propagated_costs.free();
 
+    // Quadric simplification buffers
+    quadric_optimal_positions.free();
+    vertex_qems.free();
+
     atlas_chart_ids.free();
     atlas_chart_vertex_map.free();
     atlas_chart_faces.free();
@@ -118,6 +122,7 @@ void CuMesh::clear_cache() {
     faces_map.free();
     edge_collapse_costs.free();
     propagated_costs.free();
+    quadric_optimal_positions.free();
 
     atlas_chart_ids.free();
     atlas_chart_vertex_map.free();
